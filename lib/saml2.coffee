@@ -277,6 +277,44 @@ decrypt_assertion = (dom, private_keys, cb) ->
   catch err
     cb new Error("Decrypt failed: #{util.inspect err}")
 
+# This checks the signature of a saml document and returns either array containing the signed data if valid, or null
+# if the signature is invalid. Comparing the result against null is NOT sufficient for signature checks as it doesn't
+# verify the signature is signing the important content, nor is it preventing the parsing of unsigned content.
+check_saml_signature = (xml, certificate) ->
+  doc = (new xmldom.DOMParser()).parseFromString(xml)
+
+  signature = xmlcrypto.xpath(doc, "./*[local-name(.)='Signature' and namespace-uri(.)='http://www.w3.org/2000/09/xmldsig#']")
+  return null unless signature.length is 1
+  sig = new xmlcrypto.SignedXml()
+  sig.keyInfoProvider = getKey: -> format_pem(certificate, 'CERTIFICATE')
+  sig.loadSignature signature[0].toString()
+  valid = sig.checkSignature xml
+  if valid
+    return get_signed_data(doc, sig)
+  else
+    return null
+
+# Gets the data that is actually signed according to xml-crypto. This function should mirror the way xml-crypto finds
+# elements for security reasons.
+get_signed_data = (doc, sig) ->
+  _.map sig.references, (ref) ->
+    uri = ref.uri
+    if uri[0] is '#'
+      uri = uri.substring(1)
+
+    elem = []
+    if uri is ""
+      elem = xmlcrypto.xpath(doc, "//*")
+    else
+      for idAttribute in ["Id", "ID"]
+        elem = xmlcrypto.xpath(doc, "//*[@*[local-name(.)='" + idAttribute + "']='" + uri + "']")
+        if elem.length > 0
+          break
+
+    unless elem.length > 0
+      throw new Error("Invalid signature; must be a reference to '#{ref.uri}'")
+    sig.getCanonXml ref.transforms, elem[0], { inclusiveNamespacesPrefixList: ref.inclusiveNamespacesPrefixList }
+
 # Takes in an xml @dom of an object containing a SAML Response and returns an object containing the Destination and
 # InResponseTo attributes of the Response if present. It will throw an error if the Response is missing or does not
 # appear to be valid.
@@ -428,7 +466,7 @@ parse_authn_response = (saml_response, sp_private_keys, idp_certificates, allow_
     (cb_wf) ->
       decrypt_assertion saml_response, sp_private_keys, (err, result) ->
         return cb_wf null, result unless err?
-        return cb_wf err, result unless allow_unencrypted
+        return cb_wf err, result unless allow_unencrypted and err.message == "Expected 1 EncryptedAssertion; found 0."
         assertion = saml_response.getElementsByTagNameNS(XMLNS.SAML, 'Assertion')
         unless assertion.length is 1
           return cb_wf new Error("Expected 1 Assertion or 1 EncryptedAssertion; found #{assertion.length}")
@@ -619,7 +657,7 @@ module.exports.ServiceProvider =
                 if audiences?.length > 0
                   validAudience = _.find audiences, (audience) ->
                     audienceValue = audience.firstChild?.data?.trim()
-                    !_.isEmpty(audienceValue.trim()) and (
+                    !_.isEmpty(audienceValue?.trim()) and (
                       (_.isRegExp(options.audience) and options.audience.test(audienceValue)) or
                       (_.isString(options.audience) and options.audience.toLowerCase() == audienceValue.toLowerCase())
                     )
